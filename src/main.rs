@@ -201,7 +201,6 @@ fn get_service_measurements(docker_scopes: bool) -> HashMap<String, PsiMeasureme
 
         let dir_name = {
             let parent = path.parent().unwrap().strip_prefix(MOUNTPOINT).unwrap();
-            let parent_filename = parent.file_name().unwrap();
 
             let mut dir_name = std::path::Path::new("/")
                 .join(parent)
@@ -209,10 +208,12 @@ fn get_service_measurements(docker_scopes: bool) -> HashMap<String, PsiMeasureme
                 .unwrap()
                 .to_string();
 
-            if is_interesting_scope(parent_filename.to_str().unwrap(), docker_scopes) {
-                // docker lookup is somewhat expensive
-                if let Some(new_dir) = map_docker_scope(dir_name.as_str()) {
-                    dir_name = new_dir;
+            if let Some(parent_filename) = parent.file_name() {
+                if is_interesting_scope(parent_filename.to_str().unwrap(), docker_scopes) {
+                    // docker lookup is somewhat expensive
+                    if let Some(new_dir) = map_docker_scope(dir_name.as_str()) {
+                        dir_name = new_dir;
+                    }
                 }
             }
 
