@@ -200,13 +200,16 @@ fn get_service_measurements(docker_scopes: bool) -> HashMap<String, PsiMeasureme
         let path = entry.path();
 
         let dir_name = {
+            let parent = path.parent().unwrap().strip_prefix(MOUNTPOINT).unwrap();
+            let parent_filename = parent.file_name().unwrap();
+
             let mut dir_name = std::path::Path::new("/")
-                .join(path.parent().unwrap().strip_prefix(MOUNTPOINT).unwrap())
+                .join(parent)
                 .to_str()
                 .unwrap()
                 .to_string();
 
-            if is_interesting_scope(dir_name.as_str(), docker_scopes) {
+            if is_interesting_scope(parent_filename.to_str().unwrap(), docker_scopes) {
                 // docker lookup is somewhat expensive
                 if let Some(new_dir) = map_docker_scope(dir_name.as_str()) {
                     dir_name = new_dir;
@@ -308,11 +311,16 @@ fn map_docker_scope(s: &str) -> Option<String> {
         }
     }
 
-    let id = extract_id(s)?;
+    let mut path = std::path::PathBuf::from(s);
+
+    let id = {
+        let scope = path.file_name()?.to_str()?;
+        extract_id(scope)?
+    };
 
     let name = get_container_name(id)?;
 
-    let mut path = std::path::PathBuf::from(s);
+    // let mut path = std::path::PathBuf::from(s);
     path.set_file_name(format!("docker-{name}.scope"));
 
     Some(path.display().to_string())
