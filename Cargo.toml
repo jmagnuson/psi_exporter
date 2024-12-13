@@ -9,6 +9,7 @@ clap = "2"
 walkdir = "2"
 tiny_http = "0.6"
 maplit = "1.0"
+lru = "0.12"
 
 [dev-dependencies]
 simplelog = "0.7.1"

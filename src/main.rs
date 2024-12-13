@@ -3,6 +3,7 @@ use std::fs;
 use std::net;
 
 use std::io::Read;
+use lru::LruCache;
 
 use prometheus::Encoder;
 
@@ -53,6 +54,8 @@ fn main() {
 
     let docker_scopes = matches.is_present("metrics.docker-scopes");
 
+    let mut docker_scopes = docker_scopes.then(DockerScopes::default);
+
     println!("Listening address: {}", addr);
 
     let server = tiny_http::Server::http(addr).unwrap();
@@ -65,7 +68,7 @@ fn main() {
     .unwrap();
 
     for request in server.incoming_requests() {
-        let metrics = registry(&get_service_measurements(docker_scopes), report_avg, report_zeros).gather();
+        let metrics = registry(&get_service_measurements(docker_scopes.as_mut()), report_avg, report_zeros).gather();
         let mut buffer = vec![];
         encoder.encode(&metrics, &mut buffer).unwrap();
 
@@ -186,12 +189,14 @@ macro_rules! skip_fail {
     };
 }
 
-fn get_service_measurements(docker_scopes: bool) -> HashMap<String, PsiMeasurements> {
+fn get_service_measurements(mut docker_scopes: Option<&mut DockerScopes>) -> HashMap<String, PsiMeasurements> {
     let mut services: HashMap<_, PsiMeasurements> = HashMap::new();
+
+    let use_docker_scopes = docker_scopes.is_some();
 
     for entry in walkdir::WalkDir::new(MOUNTPOINT)
         .into_iter()
-        .filter_entry(|e| is_interesting(e, docker_scopes))
+        .filter_entry(|e| is_interesting(e, use_docker_scopes))
         .filter_map(|e_res| match e_res {
             Ok(e) if is_pressure(&e) => Some(e),
             _ => None,
@@ -208,13 +213,15 @@ fn get_service_measurements(docker_scopes: bool) -> HashMap<String, PsiMeasureme
                 .unwrap()
                 .to_string();
 
-            if let Some(parent_filename) = parent.file_name() {
-                if is_interesting_scope(parent_filename.to_str().unwrap(), docker_scopes) {
-                    // docker lookup is somewhat expensive
-                    if let Some(new_dir) = map_docker_scope(dir_name.as_str()) {
-                        dir_name = new_dir;
-                    }
-                }
+            let maybe_new_dir = { parent.file_name().and_then(|parent_filename| {
+                docker_scopes.as_mut().and_then(|ds| Some((parent_filename, ds)))
+            }).and_then(|(parent_filename, ds)| {
+                DockerScopes::is_interesting_scope(parent_filename.to_str().unwrap())
+                    .then(|| ds.get(dir_name.as_str())).flatten()
+            }) };
+
+            if let Some(new_dir) = maybe_new_dir {
+                dir_name = new_dir;
             }
 
             dir_name
@@ -264,67 +271,100 @@ fn populate_measurements(
     }
 }
 
-fn is_interesting_scope(s: &str, docker_scopes: bool) -> bool {
-    let starts_docker = s.starts_with("docker-");
-    let ends_scope = s.ends_with(".scope");
-    match (docker_scopes, starts_docker, ends_scope) {
-        (true, true, true) => true,
-        _ => false,
-    }
-}
-
 fn is_interesting(entry: &walkdir::DirEntry, docker_scopes: bool) -> bool {
     entry
         .file_name()
         .to_str()
-        .map(|s| !(s.ends_with(".mount") || s.ends_with(".socket")) || is_interesting_scope(s, docker_scopes))
+        .map(|s| !(s.ends_with(".mount") || s.ends_with(".socket")) || (docker_scopes && DockerScopes::is_interesting_scope(s)))
         .unwrap_or(false)
 }
 
-fn map_docker_scope(s: &str) -> Option<String> {
-    fn extract_id(input: &str) -> Option<&str> {
-        input
-            .strip_prefix("docker-")
-            .and_then(|s| s.strip_suffix(".scope"))
+struct DockerScopes {
+    cache: LruCache<String, String>,
+}
+
+impl Default for DockerScopes {
+    fn default() -> Self {
+        let docker_scope_cache_size: usize = std::env::var("PSI_EXPORTER_DOCKER_SCOPE_CACHE_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
+
+        let cache = LruCache::new(std::num::NonZeroUsize::new(docker_scope_cache_size).unwrap());
+
+        Self::new(cache)
+    }
+}
+
+impl DockerScopes {
+    pub fn new(cache: LruCache<String, String>) -> Self {
+        Self { cache }
     }
 
-    fn get_container_name(container_id: &str) -> Option<String> {
-        let output = std::process::Command::new("docker")
-            .args(["inspect", "--format", "{{.Name}}", container_id])
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                Some(name.trim_start_matches('/').to_string()) // Remove leading `/`
-            }
-            Ok(output) => {
-                eprintln!(
-                    "Docker error: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                None
-            }
-            Err(e) => {
-                eprintln!("Failed to execute docker command: {}", e);
-                None
-            }
+    pub fn is_interesting_scope(s: &str) -> bool {
+        let starts_docker = s.starts_with("docker-");
+        let ends_scope = s.ends_with(".scope");
+        match (starts_docker, ends_scope) {
+            (true, true) => true,
+            _ => false,
         }
     }
 
-    let mut path = std::path::PathBuf::from(s);
+    pub fn get(&mut self, s: &str) -> Option<String> {
+        self.map_docker_scope(s)
+    }
 
-    let id = {
-        let scope = path.file_name()?.to_str()?;
-        extract_id(scope)?
-    };
+    fn map_docker_scope(&mut self, s: &str) -> Option<String> {
+        fn extract_id(input: &str) -> Option<&str> {
+            input
+                .strip_prefix("docker-")
+                .and_then(|s| s.strip_suffix(".scope"))
+        }
 
-    let name = get_container_name(id)?;
+        fn get_container_name(container_id: &str) -> Option<String> {
+            let output = std::process::Command::new("docker")
+                .args(["inspect", "--format", "{{.Name}}", container_id])
+                .output();
 
-    // let mut path = std::path::PathBuf::from(s);
-    path.set_file_name(format!("docker-{name}.scope"));
+            match output {
+                Ok(output) if output.status.success() => {
+                    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    Some(name.trim_start_matches('/').to_string()) // Remove leading `/`
+                }
+                Ok(output) => {
+                    eprintln!(
+                        "Docker error: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                    None
+                }
+                Err(e) => {
+                    eprintln!("Failed to execute docker command: {}", e);
+                    None
+                }
+            }
+        }
 
-    Some(path.display().to_string())
+        if let Some(mapped_scope) = self.cache.get(s) {
+            return Some(mapped_scope.clone());
+        }
+
+        let mut path = std::path::PathBuf::from(s);
+
+        let id = {
+            let scope = path.file_name()?.to_str()?;
+            extract_id(scope)?
+        };
+
+        let name = get_container_name(id)?;
+
+        path.set_file_name(format!("docker-{name}.scope"));
+        let mapped_scope = path.display().to_string();
+
+        self.cache.put(s.to_string(), mapped_scope.clone());
+
+        Some(mapped_scope)
+    }
 }
 
 fn is_pressure(entry: &walkdir::DirEntry) -> bool {
