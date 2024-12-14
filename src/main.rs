@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::net;
 
-use std::io::Read;
 use lru::LruCache;
+use std::io::Read;
 
 use prometheus::Encoder;
 
@@ -68,7 +68,12 @@ fn main() {
     .unwrap();
 
     for request in server.incoming_requests() {
-        let metrics = registry(&get_service_measurements(docker_scopes.as_mut()), report_avg, report_zeros).gather();
+        let metrics = registry(
+            &get_service_measurements(docker_scopes.as_mut()),
+            report_avg,
+            report_zeros,
+        )
+        .gather();
         let mut buffer = vec![];
         encoder.encode(&metrics, &mut buffer).unwrap();
 
@@ -189,7 +194,9 @@ macro_rules! skip_fail {
     };
 }
 
-fn get_service_measurements(mut docker_scopes: Option<&mut DockerScopes>) -> HashMap<String, PsiMeasurements> {
+fn get_service_measurements(
+    mut docker_scopes: Option<&mut DockerScopes>,
+) -> HashMap<String, PsiMeasurements> {
     let mut services: HashMap<_, PsiMeasurements> = HashMap::new();
 
     let use_docker_scopes = docker_scopes.is_some();
@@ -213,12 +220,20 @@ fn get_service_measurements(mut docker_scopes: Option<&mut DockerScopes>) -> Has
                 .unwrap()
                 .to_string();
 
-            let maybe_new_dir = { parent.file_name().and_then(|parent_filename| {
-                docker_scopes.as_mut().and_then(|ds| Some((parent_filename, ds)))
-            }).and_then(|(parent_filename, ds)| {
-                DockerScopes::is_interesting_scope(parent_filename.to_str().unwrap())
-                    .then(|| ds.get(dir_name.as_str())).flatten()
-            }) };
+            let maybe_new_dir = {
+                parent
+                    .file_name()
+                    .and_then(|parent_filename| {
+                        docker_scopes
+                            .as_mut()
+                            .and_then(|ds| Some((parent_filename, ds)))
+                    })
+                    .and_then(|(parent_filename, ds)| {
+                        DockerScopes::is_interesting_scope(parent_filename.to_str().unwrap())
+                            .then(|| ds.get(dir_name.as_str()))
+                            .flatten()
+                    })
+            };
 
             if let Some(new_dir) = maybe_new_dir {
                 dir_name = new_dir;
@@ -275,7 +290,10 @@ fn is_interesting(entry: &walkdir::DirEntry, docker_scopes: bool) -> bool {
     entry
         .file_name()
         .to_str()
-        .map(|s| !(s.ends_with(".mount") || s.ends_with(".socket")) || (docker_scopes && DockerScopes::is_interesting_scope(s)))
+        .map(|s| {
+            !(s.ends_with(".mount") || s.ends_with(".socket"))
+                || (docker_scopes && DockerScopes::is_interesting_scope(s))
+        })
         .unwrap_or(false)
 }
 
